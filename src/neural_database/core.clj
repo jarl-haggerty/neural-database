@@ -11,7 +11,19 @@
            javax.swing.JPanel
            javax.swing.JLabel
            javax.swing.JPasswordField
-           javax.swing.JButton))
+           javax.swing.JButton
+           org.jfree.data.xy.XYSeries
+           org.jfree.data.xy.XYSeriesCollection
+           org.jfree.chart.ChartFactory
+           org.jfree.chart.plot.PlotOrientation
+           org.jfree.chart.ChartPanel
+           org.jfree.chart.axis.NumberAxis
+           org.jfree.chart.plot.XYPlot
+           org.jfree.chart.renderer.xy.XYErrorRenderer
+           org.jfree.chart.JFreeChart
+           org.jfree.data.xy.YIntervalSeries
+           org.jfree.data.xy.YIntervalSeriesCollection
+           org.jfree.chart.title.TextTitle))
 
 (def db
      {:classname "com.mysql.jdbc.Driver" :subprotocol "mysql" :subname "//localhost:3306/curare_trials" :user "root"})
@@ -64,9 +76,7 @@
 (defn clean-string [x] (-> x .trim (.replace " " "_")))
 
 (defn checkin-file [& file-names]
-  ;(println file-names)
   (doseq [file-name file-names]
-    (println file-name)
     (if (.isDirectory (file file-name))
       (apply checkin-file (map #(str "analysis/" %) (.list (file file-name))))
       (let [name (.replace (.substring file-name (inc (.indexOf file-name File/separator))) ".csv" "")]
@@ -97,18 +107,89 @@
 
 (defn bin-frequency [bin-size phases & experiments]
   (with-connection (assoc db :password @password)
-    (println phases experiments "connected")
-    (apply merge-with (fn [seq1 seq2] (map #(/ (+ %1 %2) 2) seq1 seq2))
-           (for [experiment experiments phase phases :when (do (println experiment) true)]
+    (apply merge-with (fn [seq1 seq2] (map #(flatten (list %2 %1)) seq1 seq2))
+           (for [experiment experiments phase phases]
              (let [[start stop] (with-query-results result
                                   [(str "SELECT start, stop FROM " phase " WHERE experiment = \"" experiment "\"")]
                                   [(:start (first result)) (:stop (first result))])
                    times (with-query-results result
                            [(str "SELECT time FROM " experiment " WHERE time > " start" AND time < " stop)]
                            (doall (map :time result)))]
-               ;(println experiment phase start stop)
                (apply merge-with #(map + %1 %2)
                       (for [time times]
-                        {phase (for [i (range (/ (- stop start) bin-size))]
-                                 (if (= i (int (/ (- time start) bin-size))) 1 0))})))))))
+                        {(keyword phase) (for [i (range (/ (- stop start) bin-size))]
+                                          (if (= i (int (/ (- time start) bin-size))) 1 0))})))))))
 
+
+
+(defn mean [& args] (/ (reduce + args) (count args)))
+(defn variance [& args]
+  (let [middle (apply mean args)]
+    (/ (reduce + (map #(Math/pow (- middle %) 2) args)) (count args))))
+(defn standard-deviation [& args] (Math/sqrt (apply variance args)))
+
+(defn normalize-by [plot unit]
+  (let [average (apply mean (map #(apply mean %) (unit plot)))]
+    (apply merge (for [p plot]
+                   {(first p) (for [x (second p)] (map #(/ % average) x))}))))
+
+(defn plot-bins
+  ([bin-size plots]
+     (let [[min-range max-range] (let [temp (flatten (for [a (vals plots) b (vals a)] b))]
+                                   [(apply min temp) (apply max temp)])
+           series
+           (apply merge
+            (for [plot plots]
+              {(first plot)
+               (apply merge
+                      (for [data (second plot)]
+                        {(first data)
+                         (let [series (YIntervalSeries. (first plot))]
+                           (doseq [i (-> (second data) count range)]
+                             (.add series (* i bin-size) (apply mean (nth (second data) i))
+                                   (- (apply mean (nth (second data) i)) (apply standard-deviation (nth (second data) i)))
+                                   (+ (apply mean (nth (second data) i)) (apply standard-deviation (nth (second data) i)))))
+                           series)}))}))
+           series-collections
+           (loop [stack series accum {}]
+             (if-let [current (first stack)]
+               (do
+                 (recur (rest stack)
+                        (loop [stack2 (second current) accum2 accum]
+                          (if-let [current2 (first stack2)]
+                            (do
+                              (recur (rest stack2)
+                                     (assoc accum2
+                                       (first current2)
+                                       (doto (get accum2
+                                                  (first current2)
+                                                  (YIntervalSeriesCollection.))
+                                         (.addSeries (second current2))))))
+                            accum2))))
+               accum))
+           panel
+           (doto (JPanel.)
+             (.setLayout (GridLayout. 1 (count series-collections))))
+           
+           charts
+           (doseq [collection series-collections]
+             (let [chart (JFreeChart. (.replace (name (first collection)) "_" " ")
+                                      (.deriveFont TextTitle/DEFAULT_FONT (float 13))
+                                      (XYPlot. (second collection)
+                                               (NumberAxis. "Time")
+                                               (NumberAxis. "Voltage")
+                                               (doto (XYErrorRenderer.)
+                                                 (.setBaseLinesVisible true)
+                                                 (.setBaseShapesVisible false)
+                                                 (.setDrawXError false)
+                                                 (.setDrawYError true)))
+                                      true)]
+               (.setLowerBound (.getRangeAxis (.getXYPlot chart)) min-range)
+               (.setUpperBound (.getRangeAxis (.getXYPlot chart)) max-range)
+               (.add panel (ChartPanel. chart))))
+           
+           frame (doto (JFrame. "Plot")
+                   (.setContentPane panel)
+                   (.setLocationRelativeTo nil)
+                   (.setVisible true)
+                   (.setExtendedState JFrame/MAXIMIZED_BOTH))])))
